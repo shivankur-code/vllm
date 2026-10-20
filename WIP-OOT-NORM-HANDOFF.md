@@ -2,6 +2,12 @@
 
 **Branch-only handoff. Not a PR, reviewed fix, or validated accelerator implementation.**
 
+Complete Azure testing-agent brief and runnable stages are now in
+`validation/oot_norm/AZURE-AGENT.md`. Start there for machine selection, safe
+authentication, test execution, evidence and cleanup. New GPU scripts are not
+yet GPU-validated. Remove validation tooling and its ignore entry from a future
+upstream PR unless maintainers explicitly request them.
+
 Base: `34ac4f96a399836393894207dae296760b413715`.
 Related limitation: https://github.com/vllm-project/vllm/pull/60218#pullrequestreview-5429690332.
 AI assistance was used. Human review and native validation are still required.
