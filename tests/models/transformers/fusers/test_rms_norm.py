@@ -407,3 +407,64 @@ def test_gathered_norm_rejects_uneven_sharding(default_vllm_config):
     norm.tp_size = 2  # emulate TP=2 without a real process group
     with pytest.raises(ValueError, match="does not tile it evenly"):
         norm(torch.randn(2, 3))  # 3 * 2 != 8
+
+
+@pytest.mark.parametrize("zero_centered", [False, True])
+@pytest.mark.parametrize("hw_agnostic", [False, True])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_fuser_preserves_vendor_norm_and_tp(
+    zero_centered, hw_agnostic, tp_size, monkeypatch, default_vllm_config
+):
+    """A base override must initialize and run behind the fuser's TP handling."""
+    import importlib
+
+    from vllm import envs
+    from vllm.model_executor.models.transformers import layers
+    from vllm.model_executor.models.transformers.fusers import rms_norm
+
+    monkeypatch.setattr(envs, "VLLM_USE_HW_AGNOSTIC", hw_agnostic)
+    name = "GemmaRMSNorm" if zero_centered else "RMSNorm"
+    base = layers._resolve("layernorm", name)
+    package = "hw_agnostic." if ".hw_agnostic." in base.__module__ else ""
+    registry = importlib.import_module(f"vllm.model_executor.{package}custom_op")
+    monkeypatch.setattr(rms_norm, name, base)
+    monkeypatch.setattr(registry, "op_registry_oot", dict(registry.op_registry_oot))
+    registry.op_registry_oot.pop(name, None)
+
+    class VendorNorm(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.vendor_initialized = True
+            self.widths = []
+
+        def forward(self, x, residual=None):
+            self.widths.append(x.shape[-1])
+            return self.forward_native(x, residual)
+
+    base.register_oot(VendorNorm)
+    source = (GemmaRMSNorm if zero_centered else RMSNorm)(16)
+    source.weight.data.copy_(torch.linspace(-0.5, 0.5, 16))
+    fuser = RMSNormFuser(zero_centered, name, eps_attr="variance_epsilon")
+    built = fuser.fuse(source, "norm", default_vllm_config)
+    assert isinstance(built, VendorNorm)
+    assert built.vendor_initialized
+    assert built.tp_size == 1
+    built.load_state_dict(source.state_dict(), strict=True)
+    assert list(built.state_dict()) == ["weight"]
+
+    x = torch.linspace(-2, 3, 48).reshape(3, 16)
+    expected = source(x)
+    torch.testing.assert_close(built(x), expected)
+    residual = torch.full_like(x, 0.25)
+    normalized, summed = built(x.clone(), residual.clone())
+    torch.testing.assert_close(normalized, source(x + residual))
+    torch.testing.assert_close(summed, x + residual)
+    built.tp_size = tp_size
+    for rank in range(tp_size):
+        built.tp_rank = rank
+        shard = x.chunk(tp_size, dim=-1)[rank]
+        monkeypatch.setattr(
+            rms_norm, "tensor_model_parallel_all_gather", lambda local: x
+        )
+        torch.testing.assert_close(built(shard), expected.chunk(tp_size, dim=-1)[rank])
+    assert built.widths == [16] * (2 + tp_size)
